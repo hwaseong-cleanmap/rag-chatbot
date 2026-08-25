@@ -14,9 +14,11 @@ vector_db/
 # Streamlit
 .streamlit/secrets.toml
 
+# Local logs
+*.log
+
 # Editors / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
