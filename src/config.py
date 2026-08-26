@@ -26,7 +26,7 @@ class Settings:
     chat_model: str = DEFAULT_CHAT_MODEL
     data_dir: Path = PROJECT_ROOT / "data"
     db_dir: Path = PROJECT_ROOT / "vector_db"
-    collection_name: str = "hwaseong_civil_documents"
+    collection_name: str = "hwaseong_collection_manuals"
     chunk_size: int = 1200
     chunk_overlap: int = 200
     top_k: int = 5

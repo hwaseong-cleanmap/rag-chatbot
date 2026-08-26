@@ -4,3 +4,4 @@ python-dotenv>=1.0,<2.0
 streamlit>=1.62,<2.0
 striprtf>=0.0.29,<1.0
 pytest>=8.0,<10.0
+pypdf>=5.0,<7.0

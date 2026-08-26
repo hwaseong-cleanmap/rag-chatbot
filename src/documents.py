@@ -1,23 +1,33 @@
-"""TXT 및 RTF 형식의 DOC 문서 로딩과 청킹."""
+"""Document loading, masking, chunking, and metadata creation."""
 
 from __future__ import annotations
 
 import hashlib
 import re
+import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree
 
+from pypdf import PdfReader
 from striprtf.striprtf import rtf_to_text
 
+from src.privacy import mask_personal_information
 
-SUPPORTED_SUFFIXES = {".txt", ".doc"}
+
+SUPPORTED_SUFFIXES = {".txt", ".doc", ".pdf", ".hwpx", ".pptx"}
 
 
 @dataclass(frozen=True)
 class SourceDocument:
     path: Path
+    relative_path: str
     text: str
     file_hash: str
+    category: str
+    document_type: str
+    page: int | None = None
 
 
 @dataclass(frozen=True)
@@ -25,16 +35,30 @@ class DocumentChunk:
     chunk_id: str
     text: str
     source: str
+    relative_path: str
     file_hash: str
     chunk_index: int
+    category: str
+    document_type: str
+    page: int | None
+
+
+@dataclass(frozen=True)
+class LoadOutcome:
+    documents: list[SourceDocument]
+    skipped_duplicates: list[str]
+    failed_files: list[str]
+    pii_counts: dict[str, int]
+    category_counts: dict[str, int]
+    total_files: int
+    processed_files: int
 
 
 def _normalize_text(text: str) -> str:
     text = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n[ \t]+", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _read_txt(path: Path) -> str:
@@ -50,18 +74,13 @@ def _read_txt(path: Path) -> str:
 def _read_doc(path: Path) -> str:
     raw = path.read_bytes()
     if not raw.lstrip().startswith(b"{\\rtf"):
-        raise ValueError(
-            f"지원하지 않는 구형 DOC 형식입니다: {path.name}. "
-            "현재 로더는 RTF 형식의 .doc 파일을 지원합니다."
-        )
-    # 일부 행정문서는 RTF 내부에 ``\binN`` 형식의 이미지 원본 바이트를
-    # 포함한다. 바이너리 데이터의 임의 중괄호가 RTF 파서를 방해하므로
-    # 선언된 길이만큼 정확히 건너뛴 뒤 텍스트를 변환한다.
-    marker = b"\\bin"
+        raise ValueError("RTF 형식이 아닌 구형 DOC 파일입니다")
+    # Some public RTF files contain embedded binary data (\\binN). Remove
+    # exactly that byte range before handing the remaining RTF to striprtf.
     cleaned = bytearray()
     position = 0
     while True:
-        marker_start = raw.find(marker, position)
+        marker_start = raw.find(b"\\bin", position)
         if marker_start < 0:
             cleaned.extend(raw[position:])
             break
@@ -70,116 +89,181 @@ def _read_doc(path: Path) -> str:
             cleaned.extend(raw[position:])
             break
         try:
-            binary_length = int(raw[marker_start + len(marker) : length_end])
+            binary_length = int(raw[marker_start + 4 : length_end])
         except ValueError:
-            cleaned.extend(raw[position : marker_start + len(marker)])
-            position = marker_start + len(marker)
+            cleaned.extend(raw[position : marker_start + 4])
+            position = marker_start + 4
             continue
         binary_end = length_end + 1 + binary_length
         if binary_end > len(raw):
-            raise ValueError(f"손상된 RTF 바이너리 블록입니다: {path.name}")
+            raise ValueError("손상된 RTF 바이너리 블록입니다")
         cleaned.extend(raw[position:marker_start])
         cleaned.extend(b" ")
         position = binary_end
+    return _normalize_text(rtf_to_text(bytes(cleaned).decode("latin-1"), errors="ignore"))
 
-    rtf = bytes(cleaned).decode("latin-1")
-    return _normalize_text(rtf_to_text(rtf, errors="ignore"))
+
+def _read_pdf(path: Path) -> list[tuple[int, str]]:
+    pages: list[tuple[int, str]] = []
+    for number, page in enumerate(PdfReader(str(path)).pages, start=1):
+        text = _normalize_text(page.extract_text() or "")
+        if text:
+            pages.append((number, text))
+    if not pages:
+        raise ValueError("텍스트를 추출할 수 없는 PDF입니다. 스캔 문서 또는 이미지 PDF인지 확인하세요.")
+    return pages
+
+
+def _read_hwpx(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            section_files = sorted(
+                name for name in archive.namelist()
+                if name.lower().startswith("contents/") and name.lower().endswith(".xml")
+            )
+            if not section_files:
+                raise ValueError("HWPX 본문 XML을 찾을 수 없습니다")
+            parts: list[str] = []
+            for name in section_files:
+                root = ElementTree.fromstring(archive.read(name))
+                parts.extend(node.text or "" for node in root.iter() if node.tag.endswith("}t"))
+    except (zipfile.BadZipFile, ElementTree.ParseError) as error:
+        raise ValueError("읽을 수 없는 HWPX 파일입니다") from error
+    text = _normalize_text("\n".join(parts))
+    if not text:
+        raise ValueError("HWPX에서 텍스트를 추출할 수 없습니다")
+    return text
+
+
+def _read_pptx(path: Path) -> str:
+    """Extract slide text directly from the PPTX ZIP/XML structure."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            slide_files = sorted(
+                name for name in archive.namelist()
+                if name.lower().startswith("ppt/slides/slide") and name.lower().endswith(".xml")
+            )
+            if not slide_files:
+                raise ValueError("PPTX 슬라이드를 찾을 수 없습니다")
+            slides: list[str] = []
+            for index, name in enumerate(slide_files, start=1):
+                root = ElementTree.fromstring(archive.read(name))
+                parts = [node.text or "" for node in root.iter() if node.tag.endswith("}t")]
+                text = _normalize_text("\n".join(parts))
+                if text:
+                    slides.append(f"[슬라이드 {index}]\n{text}")
+    except (zipfile.BadZipFile, ElementTree.ParseError) as error:
+        raise ValueError("읽을 수 없는 PPTX 파일입니다") from error
+    text = _normalize_text("\n\n".join(slides))
+    if not text:
+        raise ValueError("PPTX에서 텍스트를 추출할 수 없습니다")
+    return text
 
 
 def read_document(path: Path) -> str:
+    """Read a document; PDF text is joined for backward-compatible callers."""
     suffix = path.suffix.lower()
     if suffix == ".txt":
         return _read_txt(path)
     if suffix == ".doc":
         return _read_doc(path)
+    if suffix == ".pdf":
+        return _normalize_text("\n\n".join(text for _, text in _read_pdf(path)))
+    if suffix == ".hwpx":
+        return _read_hwpx(path)
+    if suffix == ".pptx":
+        return _read_pptx(path)
     raise ValueError(f"지원하지 않는 파일 형식입니다: {path.suffix}")
 
 
-def load_documents(data_dir: Path) -> tuple[list[SourceDocument], list[str]]:
-    """문서를 읽고, 내용이 완전히 같은 파일은 한 번만 반환한다."""
+def _category(data_dir: Path, path: Path) -> str:
+    relative = path.relative_to(data_dir)
+    return relative.parts[0] if len(relative.parts) > 1 else "기타"
+
+
+def _document_type(path: Path, category: str) -> str:
+    name = f"{category} {path.stem}"
+    if "법" in name or "조례" in name:
+        return "법령"
+    if "매뉴얼" in name or "업무" in name:
+        return "업무매뉴얼"
+    if "지침" in name or "예규" in name:
+        return "지침"
+    return "기타"
+
+
+def load_documents(data_dir: Path) -> LoadOutcome:
+    """Read supported files recursively without stopping on individual failures."""
     documents: list[SourceDocument] = []
-    skipped_duplicates: list[str] = []
+    duplicates: list[str] = []
+    failures: list[str] = []
+    pii_counts: Counter[str] = Counter()
+    categories: Counter[str] = Counter()
     seen_text_hashes: set[str] = set()
+    processed_files: set[str] = set()
+    paths = sorted(path for path in data_dir.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES)
 
-    paths = sorted(
-        path
-        for path in data_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
-    )
     for path in paths:
-        raw = path.read_bytes()
-        file_hash = hashlib.sha256(raw).hexdigest()
-        text = read_document(path)
-        if not text:
-            continue
-        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if text_hash in seen_text_hashes:
-            skipped_duplicates.append(path.name)
-            continue
-        seen_text_hashes.add(text_hash)
-        documents.append(SourceDocument(path=path, text=text, file_hash=file_hash))
+        relative_path = path.relative_to(data_dir).as_posix()
+        category = _category(data_dir, path)
+        document_type = _document_type(path, category)
+        try:
+            file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            page_texts = _read_pdf(path) if path.suffix.lower() == ".pdf" else [(None, read_document(path))]
+            file_added = False
+            for page, raw_text in page_texts:
+                masked_text, found = mask_personal_information(raw_text)
+                pii_counts.update(found)
+                if not masked_text:
+                    continue
+                text_hash = hashlib.sha256(masked_text.encode("utf-8")).hexdigest()
+                if text_hash in seen_text_hashes:
+                    duplicates.append(relative_path)
+                    continue
+                seen_text_hashes.add(text_hash)
+                documents.append(SourceDocument(path, relative_path, masked_text, file_hash, category, document_type, page))
+                file_added = True
+            if file_added:
+                processed_files.add(relative_path)
+                categories[category] += 1
+        except (OSError, ValueError):
+            failures.append(relative_path)
 
-    return documents, skipped_duplicates
+    return LoadOutcome(documents, duplicates, failures, dict(pii_counts), dict(categories), len(paths), len(processed_files))
 
 
 def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[str]:
     if chunk_size <= 0:
-        raise ValueError("chunk_size는 1 이상이어야 합니다.")
+        raise ValueError("chunk_size는 1 이상이어야 합니다")
     if overlap < 0 or overlap >= chunk_size:
-        raise ValueError("overlap은 0 이상이고 chunk_size보다 작아야 합니다.")
-
+        raise ValueError("overlap은 0 이상이고 chunk_size보다 작아야 합니다")
     chunks: list[str] = []
     start = 0
-    text_length = len(text)
-    while start < text_length:
-        target_end = min(start + chunk_size, text_length)
+    while start < len(text):
+        target_end = min(start + chunk_size, len(text))
         end = target_end
-        if target_end < text_length:
-            search_start = start + int(chunk_size * 0.6)
-            candidates = [
-                text.rfind("\n", search_start, target_end),
-                text.rfind(" ", search_start, target_end),
-            ]
-            boundary = max(candidates)
+        if target_end < len(text):
+            boundary = max(text.rfind("\n", start + int(chunk_size * 0.6), target_end), text.rfind(" ", start + int(chunk_size * 0.6), target_end))
             if boundary > start:
                 end = boundary
-
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        if end >= text_length:
+        if end >= len(text):
             break
-        next_start = max(0, end - overlap)
-        start = next_start if next_start > start else end
-
+        start = max(end - overlap, start + 1)
     return chunks
 
 
-def make_chunks(
-    documents: list[SourceDocument], chunk_size: int = 1200, overlap: int = 200
-) -> list[DocumentChunk]:
+def make_chunks(documents: list[SourceDocument], chunk_size: int = 1200, overlap: int = 200) -> list[DocumentChunk]:
     chunks: list[DocumentChunk] = []
     for document in documents:
         for index, text in enumerate(split_text(document.text, chunk_size, overlap)):
-            chunks.append(
-                DocumentChunk(
-                    chunk_id=f"{document.file_hash[:24]}-{index:05d}",
-                    text=text,
-                    source=document.path.name,
-                    file_hash=document.file_hash,
-                    chunk_index=index,
-                )
-            )
+            page_part = f"-p{document.page:04d}" if document.page else ""
+            chunks.append(DocumentChunk(f"{document.file_hash[:24]}{page_part}-{index:05d}", text, document.path.name, document.relative_path, document.file_hash, index, document.category, document.document_type, document.page))
     return chunks
 
 
-def corpus_fingerprint(
-    documents: list[SourceDocument], embedding_model: str, chunk_size: int, overlap: int
-) -> str:
-    values = [
-        embedding_model,
-        str(chunk_size),
-        str(overlap),
-        *(sorted(document.file_hash for document in documents)),
-    ]
+def corpus_fingerprint(documents: list[SourceDocument], embedding_model: str, chunk_size: int, overlap: int) -> str:
+    values = [embedding_model, str(chunk_size), str(overlap), *(sorted(f"{document.file_hash}:{document.page}" for document in documents))]
     return hashlib.sha256("|".join(values).encode("utf-8")).hexdigest()
