@@ -61,6 +61,42 @@ def test_answer_uses_chat_completions_and_returns_sources() -> None:
     assert create_calls[0]["temperature"] == 0
 
 
+def test_answer_continues_when_model_hits_output_limit() -> None:
+    service = object.__new__(RagService)
+    service.settings = Settings(
+        account_id="a" * 32,
+        api_token="secret-token",
+        base_url=f"https://api.cloudflare.com/client/v4/accounts/{'a' * 32}/ai/v1",
+    )
+    service.search = lambda _question: [SearchResult("절차 근거", "매뉴얼.hwpx", 0.8, 0)]
+    responses = iter([
+        SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="1단계: 대상 차량을 확인합니다."),
+            finish_reason="length",
+        )]),
+        SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="2단계: 공고를 진행합니다."),
+            finish_reason="stop",
+        )]),
+    ])
+    create_calls = []
+
+    def create(**kwargs):
+        create_calls.append(kwargs)
+        return next(responses)
+
+    service.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result = service.answer("자동차 공매 절차")
+
+    assert "1단계: 대상 차량을 확인합니다." in result.answer
+    assert "### 계속 (2부)" in result.answer
+    assert "2단계: 공고를 진행합니다." in result.answer
+    assert len(create_calls) == 2
+
+
 def test_rag_service_exposes_search_methods() -> None:
     """Regression test for methods accidentally nested in the build function."""
     assert hasattr(RagService, "_stats")

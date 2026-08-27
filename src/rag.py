@@ -719,23 +719,55 @@ class RagService:
             f"[근거 {index} | 출처: {item.source} | 분류: {item.category} | 유형: {item.document_type} | 페이지: {item.page or '해당 없음'}]\n{item.text}"
             for index, item in enumerate(evidence, start=1)
         )
-        response = self.client.chat.completions.create(
-            model=self.settings.chat_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+        messages = [
+            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+            {"role": "user", "content": (
+                f"[사용자 질문]\n{question}\n\n[문서 근거]\n{context}\n\n"
+                "문서 근거에 있는 내용만 답하세요. 질문 전체를 뒷받침하지 못해도 "
+                "확인 가능한 내용은 먼저 답하고, 부족한 항목만 별도로 표시하세요. "
+                "절차가 길어 한 번에 끝낼 수 없으면, 문장이 끝나는 지점에서 마무리하고 "
+                "마지막 줄에 '[계속]'이라고 표시하세요. "
+                f"근거에서 확인 가능한 내용이 전혀 없을 때만 정확히 '{NO_ANSWER}'라고 답하세요."
+            )},
+        ]
+
+        parts: list[str] = []
+        # Cloudflare의 출력 한도에서 중간 문장이 끊기는 경우, 같은 근거를 유지한 채
+        # 최대 두 번 더 이어 답하도록 한다. 호출 수를 제한해 무료 사용량도 보호한다.
+        for part_number in range(1, 4):
+            response = self.client.chat.completions.create(
+                model=self.settings.chat_model,
+                messages=messages,
+                temperature=0,
+                max_tokens=self.settings.max_answer_tokens,
+            )
+            choice = response.choices[0]
+            content = choice.message.content
+            part = content.strip() if isinstance(content, str) else ""
+            if not part:
+                break
+            parts.append(part)
+
+            finish_reason = getattr(choice, "finish_reason", None)
+            requires_continuation = (
+                finish_reason in {"length", "max_tokens"}
+                or part.rstrip().endswith("[계속]")
+            )
+            if not requires_continuation or part_number == 3:
+                break
+
+            messages.extend([
+                {"role": "assistant", "content": part},
                 {"role": "user", "content": (
-                    f"[사용자 질문]\n{question}\n\n[문서 근거]\n{context}\n\n"
-                    "문서 근거에 있는 내용만 답하세요. 질문 전체를 뒷받침하지 못해도 "
-                    "확인 가능한 내용은 먼저 답하고, 부족한 항목만 별도로 표시하세요. "
-                    f"근거에서 확인 가능한 내용이 전혀 없을 때만 정확히 '{NO_ANSWER}'라고 답하세요."
+                    "앞 답변의 바로 다음 절차부터 계속 답하세요. 이미 답한 내용은 반복하지 말고, "
+                    "문서 근거에 있는 내용만 사용하세요. 이번 부분도 문장이 끝나는 지점에서 마무리하세요."
                 )},
-            ],
-            temperature=0,
-            max_tokens=self.settings.max_answer_tokens,
-        )
-        content = response.choices[0].message.content
-        answer = content.strip() if isinstance(content, str) else ""
-        answer = answer or NO_ANSWER
+            ])
+
+        answer = "\n\n---\n\n".join(
+            part if index == 1 else f"### 계속 ({index}부)\n\n{part}"
+            for index, part in enumerate(parts, start=1)
+        ) or NO_ANSWER
         if answer == NO_ANSWER:
             return AnswerResult(NO_ANSWER, [], evidence)
         return AnswerResult(
