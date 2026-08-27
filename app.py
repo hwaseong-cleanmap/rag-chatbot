@@ -110,19 +110,19 @@ def main() -> None:
         service = get_service(settings)
         service.load_ready_index()
         primary_index_ready = True
-    except IndexStatusError as error:
+    except Exception as error:
+        # Cloud hot-reload can retain an older IndexStatusError class object.
+        # Any unavailable primary DB should still use the committed online
+        # keyword backup instead of presenting a fatal startup error.
         keyword_backup = LocalKeywordBackup(settings)
         if not keyword_backup.is_ready():
             st.error(
                 "검색 색인이 준비되지 않았습니다. 관리자가 VS Code 터미널에서 "
                 "`python -m scripts.build_index`를 한 번 실행해야 합니다."
             )
-            st.caption(f"상태: {error.code}")
+            st.caption(f"상태: {getattr(error, 'code', type(error).__name__)}")
             st.stop()
         st.info("온라인 경량 검색 모드로 실행 중입니다. 근거 문서의 키워드를 우선 검색합니다.")
-    except Exception as error:
-        st.error(f"검색 DB를 여는 중 오류가 발생했습니다: {error}")
-        st.stop()
     show_sidebar(service, settings, primary_index_ready)
 
     if "messages" not in st.session_state:
