@@ -48,8 +48,8 @@ def show_sources(evidence: list[object]) -> None:
             st.caption(" · ".join(details))
 
 
-def show_sidebar(service: RagService, settings: Settings) -> None:
-    stats = service.document_stats()
+def show_sidebar(service: RagService, settings: Settings, primary_index_ready: bool) -> None:
+    stats = service.document_stats() if primary_index_ready else LocalKeywordBackup(settings).stats()
     with st.sidebar:
         st.header(":material/folder_managed: 징수과 업무자료")
         st.metric("등록 문서", f"{stats.get('documents', 0)}건")
@@ -123,7 +123,7 @@ def main() -> None:
     except Exception as error:
         st.error(f"검색 DB를 여는 중 오류가 발생했습니다: {error}")
         st.stop()
-    show_sidebar(service, settings)
+    show_sidebar(service, settings, primary_index_ready)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []

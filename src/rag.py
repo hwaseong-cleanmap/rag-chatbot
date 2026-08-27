@@ -84,7 +84,15 @@ class LocalKeywordBackup:
 
     @staticmethod
     def _tokens(value: str) -> list[str]:
-        return [token for token in __import__("re").findall(r"[0-9A-Za-z가-힣]{2,}", value.lower())]
+        tokens = __import__("re").findall(r"[0-9A-Za-z가-힣]{2,}", value.lower())
+        # Korean queries are often written without spaces ("자동차공매절차").
+        # Include meaningful character n-grams so they can still match
+        # document wording such as "압류자동차 공매 절차".
+        for word in list(tokens):
+            if __import__("re").fullmatch(r"[가-힣]{4,}", word):
+                for size in range(2, min(6, len(word)) + 1):
+                    tokens.extend(word[index : index + size] for index in range(len(word) - size + 1))
+        return list(dict.fromkeys(tokens))
 
     def build(self, progress_callback: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
         outcome = load_documents(
@@ -110,6 +118,17 @@ class LocalKeywordBackup:
             return payload.get("status") == "ready" and bool(payload.get("records"))
         except (OSError, ValueError, json.JSONDecodeError):
             return False
+
+    def stats(self) -> dict[str, int]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            records = payload.get("records", [])
+            return {
+                "documents": len({record["relative_path"] for record in records}),
+                "chunks": len(records),
+            }
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            return {"documents": 0, "chunks": 0}
 
     def search(self, question: str, limit: int) -> list[SearchResult]:
         payload = json.loads(self.path.read_text(encoding="utf-8"))
