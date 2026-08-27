@@ -14,7 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 import chromadb
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from openai import OpenAI
 
 from src.config import Settings
 from src.documents import LoadOutcome, corpus_fingerprint, load_documents, make_chunks, source_manifest
@@ -131,9 +131,11 @@ class LocalKeywordBackup:
 
 def _is_failover_error(error: Exception) -> bool:
     """Only availability failures trigger a provider switch, never bad answers."""
+    error_name = type(error).__name__
+    status_code = getattr(error, "status_code", None)
     return (
-        isinstance(error, (APIConnectionError, APITimeoutError))
-        or (isinstance(error, APIStatusError) and error.status_code in {408, 429, 500, 502, 503, 504})
+        error_name in {"APIConnectionError", "APITimeoutError"}
+        or status_code in {408, 429, 500, 502, 503, 504}
     )
 
 
