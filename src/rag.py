@@ -719,70 +719,25 @@ class RagService:
             f"[근거 {index} | 출처: {item.source} | 분류: {item.category} | 유형: {item.document_type} | 페이지: {item.page or '해당 없음'}]\n{item.text}"
             for index, item in enumerate(evidence, start=1)
         )
-        messages = [
-            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-            {"role": "user", "content": (
-                f"[사용자 질문]\n{question}\n\n[문서 근거]\n{context}\n\n"
-                "문서 근거에 있는 내용만 답하세요. 질문 전체를 뒷받침하지 못해도 "
-                "확인 가능한 내용은 먼저 답하고, 부족한 항목만 별도로 표시하세요. "
-                "절차 답변은 한 부분에 2~3개 단계씩 간결하게 작성하세요. 절차가 길어 한 번에 끝낼 수 없으면, 문장이 끝나는 지점에서 마무리하고 "
-                "마지막 줄에 '[계속]'이라고 표시하세요. "
-                f"근거에서 확인 가능한 내용이 전혀 없을 때만 정확히 '{NO_ANSWER}'라고 답하세요."
-            )},
-        ]
-
-        parts: list[str] = []
-        # Cloudflare의 출력 한도에서 중간 문장이 끊기는 경우, 같은 근거를 유지한 채
-        # 최대 네 번 더 이어 답하도록 한다. 호출 수를 제한해 무료 사용량도 보호한다.
-        max_parts = 5
-        needs_more = False
-        for part_number in range(1, max_parts + 1):
-            response = self.client.chat.completions.create(
-                model=self.settings.chat_model,
-                messages=messages,
-                temperature=0,
-                max_tokens=self.settings.max_answer_tokens,
-            )
-            choice = response.choices[0]
-            content = choice.message.content
-            part = content.strip() if isinstance(content, str) else ""
-            if not part:
-                break
-            parts.append(part)
-
-            finish_reason = getattr(choice, "finish_reason", None)
-            ends_like_complete_sentence = part.rstrip().endswith(
-                (".", "!", "?", "다", "요", "죠", "]")
-            )
-            needs_more = (
-                finish_reason in {"length", "max_tokens"}
-                or part.rstrip().endswith("[계속]")
-                # 일부 호환 API는 출력 한도에 걸려도 finish_reason을 주지 않는다.
-                # 이때는 문장이 미완성인 경우를 한 번 더 이어 생성한다.
-                or not ends_like_complete_sentence
-            )
-            if not needs_more or part_number == max_parts:
-                break
-
-            messages.extend([
-                {"role": "assistant", "content": part},
+        response = self.client.chat.completions.create(
+            model=self.settings.chat_model,
+            messages=[
+                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                 {"role": "user", "content": (
-                    "앞 답변의 바로 다음 절차부터 계속 답하세요. 이미 답한 내용은 반복하지 말고, "
-                    "문서 근거에 있는 내용만 사용하세요. 다음 2~3개 단계만 간결하게 답하고 "
-                    "문장이 끝나는 지점에서 마무리하세요."
+                    f"[사용자 질문]\n{question}\n\n[문서 근거]\n{context}\n\n"
+                    "문서 근거에 있는 내용만 답하세요. 질문 전체를 뒷받침하지 못해도 "
+                    "확인 가능한 내용은 먼저 답하고, 부족한 항목만 별도로 표시하세요. "
+                    "절차 질문은 전체 흐름을 1단계, 2단계처럼 번호를 붙여 한 번에 답하되, "
+                    "각 단계는 핵심 내용만 1~3개 항목으로 간결하게 쓰고 반드시 문장을 끝맺으세요. "
+                    f"근거에서 확인 가능한 내용이 전혀 없을 때만 정확히 '{NO_ANSWER}'라고 답하세요."
                 )},
-            ])
-
-        answer = "\n\n---\n\n".join(
-            part if index == 1 else f"### 계속 ({index}부)\n\n{part}"
-            for index, part in enumerate(parts, start=1)
-        ) or NO_ANSWER
-        if parts and needs_more and len(parts) == max_parts:
-            answer += (
-                "\n\n---\n\n"
-                "※ 답변이 길어 자동 이어쓰기 한도(5부)에 도달했습니다. "
-                "계속 필요한 경우 ‘자동차 공매 절차의 다음 단계만 알려줘’처럼 질문해 주세요."
-            )
+            ],
+            temperature=0,
+            max_tokens=self.settings.max_answer_tokens,
+        )
+        content = response.choices[0].message.content
+        answer = content.strip() if isinstance(content, str) else ""
+        answer = answer or NO_ANSWER
         if answer == NO_ANSWER:
             return AnswerResult(NO_ANSWER, [], evidence)
         return AnswerResult(

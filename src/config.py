@@ -39,7 +39,9 @@ class Settings:
     chunk_overlap: int = 300
     top_k: int = 6
     min_similarity: float = 0.35
-    max_answer_tokens: int = 1000
+    # The Workers AI Qwen model supports up to 2,000 output tokens per call.
+    # A single complete response is more reliable than stitching partial calls.
+    max_answer_tokens: int = 2000
     embedding_batch_size: int = 32
     ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL
     ollama_chat_model: str = DEFAULT_OLLAMA_CHAT_MODEL
