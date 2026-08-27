@@ -39,12 +39,26 @@ def show_sources(evidence: list[object]) -> None:
     if not evidence:
         return
     st.markdown("#### 근거자료")
+    # 검색 결과는 청크 단위이므로 같은 문서가 여러 번 포함될 수 있다.
+    # 화면에서는 문서별로 한 번만 보여 주고, 참조된 페이지·청크 수만 요약한다.
+    grouped: dict[str, list[object]] = {}
     for item in evidence:
+        key = getattr(item, "relative_path", "") or item.source
+        grouped.setdefault(key, []).append(item)
+
+    for items in grouped.values():
+        item = items[0]
         with st.container(border=True):
             st.markdown(f":material/description: **{item.source}**")
             details = [f"업무 분류: {item.category}", f"문서 유형: {item.document_type}"]
-            if item.page:
-                details.append(f"페이지: {item.page}")
+            pages = sorted({entry.page for entry in items if entry.page})
+            if pages:
+                page_label = ", ".join(str(page) for page in pages[:8])
+                if len(pages) > 8:
+                    page_label += " 외"
+                details.append(f"참조 페이지: {page_label}")
+            if len(items) > 1:
+                details.append(f"관련 내용 {len(items)}개 청크")
             st.caption(" · ".join(details))
 
 
