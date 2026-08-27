@@ -27,11 +27,14 @@ class Settings:
     data_dir: Path = PROJECT_ROOT / "data"
     db_dir: Path = PROJECT_ROOT / "vector_db"
     collection_name: str = "hwaseong_collection_manuals"
-    chunk_size: int = 1200
-    chunk_overlap: int = 200
-    top_k: int = 5
+    # Larger, overlapping chunks preserve a complete statutory article or a
+    # short procedure section.  This reduces the chance of answering from a
+    # single item in a numbered list.
+    chunk_size: int = 1800
+    chunk_overlap: int = 300
+    top_k: int = 6
     min_similarity: float = 0.35
-    max_answer_tokens: int = 700
+    max_answer_tokens: int = 1000
     embedding_batch_size: int = 32
 
     @classmethod

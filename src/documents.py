@@ -6,6 +6,7 @@ import hashlib
 import re
 import zipfile
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
@@ -192,7 +193,10 @@ def _document_type(path: Path, category: str) -> str:
     return "기타"
 
 
-def load_documents(data_dir: Path) -> LoadOutcome:
+def load_documents(
+    data_dir: Path,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> LoadOutcome:
     """Read supported files recursively without stopping on individual failures."""
     documents: list[SourceDocument] = []
     duplicates: list[str] = []
@@ -203,8 +207,10 @@ def load_documents(data_dir: Path) -> LoadOutcome:
     processed_files: set[str] = set()
     paths = sorted(path for path in data_dir.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES)
 
-    for path in paths:
+    for file_number, path in enumerate(paths, start=1):
         relative_path = path.relative_to(data_dir).as_posix()
+        if progress_callback:
+            progress_callback(file_number, len(paths), relative_path)
         category = _category(data_dir, path)
         document_type = _document_type(path, category)
         try:
@@ -232,18 +238,38 @@ def load_documents(data_dir: Path) -> LoadOutcome:
     return LoadOutcome(documents, duplicates, failures, dict(pii_counts), dict(categories), len(paths), len(processed_files))
 
 
-def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[str]:
-    if chunk_size <= 0:
-        raise ValueError("chunk_size는 1 이상이어야 합니다")
-    if overlap < 0 or overlap >= chunk_size:
-        raise ValueError("overlap은 0 이상이고 chunk_size보다 작아야 합니다")
+def source_manifest(data_dir: Path) -> list[dict[str, int | str]]:
+    """Return inexpensive file metadata used to detect source changes.
+
+    This deliberately does not open PDF/HWPX/PPTX contents.  The resulting
+    manifest lets a completed index be reused immediately after an app restart.
+    """
+    paths = sorted(
+        path for path in data_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+    )
+    return [
+        {
+            "path": path.relative_to(data_dir).as_posix(),
+            "size": path.stat().st_size,
+            "modified_ns": path.stat().st_mtime_ns,
+        }
+        for path in paths
+    ]
+
+
+def _split_by_size(text: str, chunk_size: int, overlap: int) -> list[str]:
+    """Split prose without breaking near the start of a line where possible."""
     chunks: list[str] = []
     start = 0
     while start < len(text):
         target_end = min(start + chunk_size, len(text))
         end = target_end
         if target_end < len(text):
-            boundary = max(text.rfind("\n", start + int(chunk_size * 0.6), target_end), text.rfind(" ", start + int(chunk_size * 0.6), target_end))
+            boundary = max(
+                text.rfind("\n", start + int(chunk_size * 0.6), target_end),
+                text.rfind(" ", start + int(chunk_size * 0.6), target_end),
+            )
             if boundary > start:
                 end = boundary
         chunk = text[start:end].strip()
@@ -252,6 +278,30 @@ def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[st
         if end >= len(text):
             break
         start = max(end - overlap, start + 1)
+    return chunks
+
+
+def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[str]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size는 1 이상이어야 합니다")
+    if overlap < 0 or overlap >= chunk_size:
+        raise ValueError("overlap은 0 이상이고 chunk_size보다 작아야 합니다")
+    # A law article must be retrieved as one unit whenever possible.  Generic
+    # length-only chunking previously split a single article's numbered items.
+    article_starts = [match.start() for match in re.finditer(r"(?m)^\s*제\s*\d+\s*조(?:의\s*\d+)?", text)]
+    if len(article_starts) < 2:
+        return _split_by_size(text, chunk_size, overlap)
+
+    boundaries = [0, *article_starts[1:], len(text)]
+    chunks: list[str] = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        section = text[start:end].strip()
+        if not section:
+            continue
+        if len(section) <= chunk_size:
+            chunks.append(section)
+        else:
+            chunks.extend(_split_by_size(section, chunk_size, overlap))
     return chunks
 
 

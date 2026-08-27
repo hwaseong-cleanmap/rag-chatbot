@@ -59,3 +59,11 @@ def test_answer_uses_chat_completions_and_returns_sources() -> None:
     assert result.sources == ["조례.doc"]
     assert create_calls[0]["model"] == service.settings.chat_model
     assert create_calls[0]["temperature"] == 0
+
+
+def test_rag_service_exposes_search_methods() -> None:
+    """Regression test for methods accidentally nested in the build function."""
+    assert hasattr(RagService, "_stats")
+    assert hasattr(RagService, "document_stats")
+    assert hasattr(RagService, "search")
+    assert hasattr(RagService, "answer")

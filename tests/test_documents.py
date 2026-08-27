@@ -78,6 +78,17 @@ def test_split_text_respects_size_and_overlap() -> None:
     assert all(0 < len(chunk) <= 200 for chunk in chunks)
 
 
+def test_split_text_keeps_a_short_law_article_together() -> None:
+    text = (
+        "제1조(목적) 이 법의 목적을 정한다.\n"
+        "제2조(정의) 이 법에서 사용하는 용어의 뜻은 다음과 같다.\n"
+        "① 첫째 항\n② 둘째 항\n③ 셋째 항\n"
+        "제3조(적용) 이 법을 적용한다."
+    )
+    chunks = split_text(text, chunk_size=200, overlap=30)
+    assert any("제2조" in chunk and "①" in chunk and "③" in chunk for chunk in chunks)
+
+
 @pytest.mark.parametrize(("chunk_size", "overlap"), [(0, 0), (100, -1), (100, 100), (100, 101)])
 def test_split_text_rejects_invalid_settings(chunk_size: int, overlap: int) -> None:
     with pytest.raises(ValueError):

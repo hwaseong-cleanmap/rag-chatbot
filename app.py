@@ -8,7 +8,7 @@ import streamlit as st
 
 from src.config import Settings
 from src.privacy import detect_personal_information
-from src.rag import RagService
+from src.rag import IndexStatusError, RagService, build_index_atomically
 
 
 SUGGESTIONS = {
@@ -60,13 +60,15 @@ def show_sidebar(service: RagService, settings: Settings) -> None:
         if st.button("문서 다시 색인", width="stretch", icon=":material/refresh:"):
             try:
                 with st.spinner("문서를 확인하고 검색 색인을 준비하고 있습니다..."):
-                    stats = service.ensure_index(force=True)
+                    stats = build_index_atomically(settings)
+                get_service.clear()
                 st.success(f"정상 처리 {stats['documents']}건 · 청크 {stats['chunks']:,}개")
                 st.caption(f"중복 제외 {stats['duplicates']}건 · 처리 실패 {stats['failures']}건")
                 if stats["pii_counts"]:
                     st.caption("개인정보 마스킹: " + ", ".join(f"{name} {count}건" for name, count in stats["pii_counts"].items()))
                 if stats["failed_files"]:
                     st.caption("실패 파일: " + ", ".join(stats["failed_files"]))
+                st.rerun()
             except Exception as error:
                 st.error(f"색인 실패: {error}")
         if st.button("대화 내용 지우기", width="stretch", icon=":material/delete_sweep:"):
@@ -100,10 +102,17 @@ def main() -> None:
         st.stop()
 
     try:
-        with st.spinner("업무자료 검색 준비 중..."):
-            service = get_service(settings)
+        service = get_service(settings)
+        service.load_ready_index()
+    except IndexStatusError as error:
+        st.error(
+            "검색 색인이 준비되지 않았습니다. 관리자가 VS Code 터미널에서 "
+            "`python -m scripts.build_index`를 한 번 실행해야 합니다."
+        )
+        st.caption(f"상태: {error.code}")
+        st.stop()
     except Exception as error:
-        st.error(f"검색 DB 준비 중 오류가 발생했습니다: {error}")
+        st.error(f"검색 DB를 여는 중 오류가 발생했습니다: {error}")
         st.stop()
     show_sidebar(service, settings)
 
