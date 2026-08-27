@@ -89,6 +89,21 @@ def test_split_text_keeps_a_short_law_article_together() -> None:
     assert any("제2조" in chunk and "①" in chunk and "③" in chunk for chunk in chunks)
 
 
+def test_law_chunks_do_not_exceed_legal_maximum() -> None:
+    text = "제1조(목적) " + ("가" * 1400) + "\n제2조(정의) " + ("나" * 100)
+    chunks = split_text(text, chunk_size=1800, overlap=300, document_type="법령")
+    assert all(len(chunk) <= 1200 for chunk in chunks)
+    assert any("제2조" in chunk for chunk in chunks)
+
+
+def test_manual_chunks_follow_headings_and_manual_maximum() -> None:
+    text = "1. 사전 준비\n" + ("가" * 500) + "\n2. 집행\n" + ("나" * 500) + "\n3. 사후 처리\n" + ("다" * 500)
+    chunks = split_text(text, chunk_size=1800, overlap=300, document_type="업무매뉴얼")
+    assert all(len(chunk) <= 1500 for chunk in chunks)
+    assert any("1. 사전 준비" in chunk for chunk in chunks)
+    assert any("3. 사후 처리" in chunk for chunk in chunks)
+
+
 @pytest.mark.parametrize(("chunk_size", "overlap"), [(0, 0), (100, -1), (100, 100), (100, 101)])
 def test_split_text_rejects_invalid_settings(chunk_size: int, overlap: int) -> None:
     with pytest.raises(ValueError):

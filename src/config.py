@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import replace
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,9 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CHAT_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
 DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-m3"
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
+DEFAULT_OLLAMA_CHAT_MODEL = "qwen3:4b"
+DEFAULT_OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,7 @@ class Settings:
     base_url: str
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     chat_model: str = DEFAULT_CHAT_MODEL
+    provider: str = "cloudflare"
     data_dir: Path = PROJECT_ROOT / "data"
     db_dir: Path = PROJECT_ROOT / "vector_db"
     collection_name: str = "hwaseong_collection_manuals"
@@ -36,6 +41,9 @@ class Settings:
     min_similarity: float = 0.35
     max_answer_tokens: int = 1000
     embedding_batch_size: int = 32
+    ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL
+    ollama_chat_model: str = DEFAULT_OLLAMA_CHAT_MODEL
+    ollama_embedding_model: str = DEFAULT_OLLAMA_EMBEDDING_MODEL
 
     @classmethod
     def from_env(cls, secrets: Mapping[str, object] | None = None) -> "Settings":
@@ -65,9 +73,40 @@ class Settings:
             base_url=base_url.rstrip("/"),
             embedding_model=value("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
             chat_model=value("CHAT_MODEL", DEFAULT_CHAT_MODEL),
+            ollama_base_url=value("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
+            ollama_chat_model=value("OLLAMA_CHAT_MODEL", DEFAULT_OLLAMA_CHAT_MODEL),
+            ollama_embedding_model=value("OLLAMA_EMBEDDING_MODEL", DEFAULT_OLLAMA_EMBEDDING_MODEL),
+        )
+
+    def for_ollama(self) -> "Settings":
+        """Return isolated settings for the local backup RAG index."""
+        return replace(
+            self,
+            account_id="ollama",
+            api_token="ollama",
+            base_url=self.ollama_base_url.rstrip("/"),
+            embedding_model=self.ollama_embedding_model,
+            chat_model=self.ollama_chat_model,
+            provider="ollama",
+            # A CPU-only local model can take longer than a remote API for a
+            # large batch. Smaller batches avoid read timeouts on Windows PCs.
+            embedding_batch_size=4,
+            db_dir=PROJECT_ROOT / "vector_db_ollama",
+            collection_name="hwaseong_collection_manuals_ollama",
         )
 
     def validate(self) -> None:
+        if self.provider == "ollama":
+            parsed_url = urlparse(self.base_url)
+            if parsed_url.scheme != "http" or parsed_url.hostname not in {"127.0.0.1", "localhost"}:
+                raise ValueError("OLLAMA_BASE_URL은 이 컴퓨터의 Ollama 주소여야 합니다.")
+            if not self.chat_model or not self.embedding_model:
+                raise ValueError("Ollama 답변·임베딩 모델 이름을 설정해야 합니다.")
+            if not self.data_dir.exists():
+                raise FileNotFoundError(f"문서 폴더를 찾을 수 없습니다: {self.data_dir}")
+            return
+        if self.provider != "cloudflare":
+            raise ValueError("지원하지 않는 AI 제공자입니다.")
         if not re.fullmatch(r"[0-9a-fA-F]{32}", self.account_id):
             raise ValueError(
                 "CLOUDFLARE_ACCOUNT_ID는 이메일이 아니라 Cloudflare에서 복사한 "

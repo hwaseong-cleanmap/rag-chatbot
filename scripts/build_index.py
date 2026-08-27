@@ -1,4 +1,4 @@
-"""Build the local RAG search index before starting the Streamlit service.
+"""Build Cloudflare and Ollama RAG indexes before starting Streamlit.
 
 Run from the project root:
     python -m scripts.build_index
@@ -7,7 +7,7 @@ Run from the project root:
 from __future__ import annotations
 
 from src.config import Settings
-from src.rag import build_index_atomically
+from src.rag import build_all_indexes
 
 
 def main() -> None:
@@ -21,23 +21,23 @@ def main() -> None:
 
     def report(message: str, current: int, total: int) -> None:
         nonlocal last_document_reported
-        # Avoid flooding the terminal while still proving that a large corpus is moving.
-        if message.startswith("문서 읽는 중"):
-            if current != total and current - last_document_reported < 5:
-                return
-            last_document_reported = current
+        if "문서" in message and current != total and current - last_document_reported < 5:
+            return
+        last_document_reported = current
         print(f"[{current:,}/{total:,}] {message}", flush=True)
 
-    print("업무자료 검색 색인을 준비합니다.", flush=True)
-    # The live DB is replaced only after the staging DB finishes validation.
-    # Close Streamlit before running this command on Windows.
-    stats = build_index_atomically(settings, report=report)
-    print(
-        "색인 완료: "
-        f"문서 {stats['documents']}건, 청크 {stats['chunks']:,}개, "
-        f"처리 실패 {stats['failures']}건",
-        flush=True,
-    )
+    print("Ollama 로컬 백업 → Cloudflare 순서로 색인을 준비합니다.", flush=True)
+    results = build_all_indexes(settings, report=report)
+    for provider in ("ollama", "cloudflare"):
+        stats = results.get(provider)
+        if isinstance(stats, dict):
+            print(
+                f"{provider} 색인 완료: 문서 {stats['documents']}건 · "
+                f"청크 {stats['chunks']:,}개 · 처리 실패 {stats['failures']}건",
+                flush=True,
+            )
+        else:
+            print(f"{provider} 색인 실패: {results.get(f'{provider}_error', '알 수 없는 오류')}", flush=True)
 
 
 if __name__ == "__main__":

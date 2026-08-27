@@ -196,8 +196,13 @@ def _document_type(path: Path, category: str) -> str:
 def load_documents(
     data_dir: Path,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    paths: list[Path] | None = None,
 ) -> LoadOutcome:
-    """Read supported files recursively without stopping on individual failures."""
+    """Read supported files recursively without stopping on individual failures.
+
+    ``paths`` enables incremental indexing.  Callers pass only files that were
+    added or changed, so unchanged PDF/HWPX files are never opened again.
+    """
     documents: list[SourceDocument] = []
     duplicates: list[str] = []
     failures: list[str] = []
@@ -205,7 +210,8 @@ def load_documents(
     categories: Counter[str] = Counter()
     seen_text_hashes: set[str] = set()
     processed_files: set[str] = set()
-    paths = sorted(path for path in data_dir.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES)
+    source_paths = paths if paths is not None else list(data_dir.rglob("*"))
+    paths = sorted(path for path in source_paths if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES)
 
     for file_number, path in enumerate(paths, start=1):
         relative_path = path.relative_to(data_dir).as_posix()
@@ -281,7 +287,49 @@ def _split_by_size(text: str, chunk_size: int, overlap: int) -> list[str]:
     return chunks
 
 
-def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[str]:
+def _heading_sections(text: str) -> list[str]:
+    """Split manuals at common Korean procedure headings without losing text."""
+    starts = [match.start() for match in re.finditer(
+        r"(?m)^\s*(?:\d+[.)]|[가-하][.)]|[Ⅰ-Ⅹ]+[.)]|\([0-9가-하]\)|[□■◆])\s+",
+        text,
+    )]
+    if len(starts) < 2:
+        return [text]
+    boundaries = [0, *starts[1:], len(text)]
+    return [text[start:end].strip() for start, end in zip(boundaries, boundaries[1:]) if text[start:end].strip()]
+
+
+def _pack_manual_sections(sections: list[str], target_size: int, maximum_size: int, overlap: int) -> list[str]:
+    """Keep procedure headings together, packing short adjacent sections only."""
+    chunks: list[str] = []
+    pending = ""
+    for section in sections:
+        if len(section) > maximum_size:
+            if pending:
+                chunks.append(pending)
+                pending = ""
+            chunks.extend(_split_by_size(section, maximum_size, overlap))
+            continue
+        candidate = f"{pending}\n\n{section}".strip() if pending else section
+        if pending and len(candidate) > maximum_size:
+            chunks.append(pending)
+            pending = section
+        else:
+            pending = candidate
+        if len(pending) >= target_size:
+            chunks.append(pending)
+            pending = ""
+    if pending:
+        chunks.append(pending)
+    return chunks
+
+
+def split_text(
+    text: str,
+    chunk_size: int = 1200,
+    overlap: int = 200,
+    document_type: str = "기타",
+) -> list[str]:
     if chunk_size <= 0:
         raise ValueError("chunk_size는 1 이상이어야 합니다")
     if overlap < 0 or overlap >= chunk_size:
@@ -289,26 +337,33 @@ def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[st
     # A law article must be retrieved as one unit whenever possible.  Generic
     # length-only chunking previously split a single article's numbered items.
     article_starts = [match.start() for match in re.finditer(r"(?m)^\s*제\s*\d+\s*조(?:의\s*\d+)?", text)]
-    if len(article_starts) < 2:
-        return _split_by_size(text, chunk_size, overlap)
+    if document_type == "법령" or len(article_starts) >= 2:
+        law_maximum = min(chunk_size, 1200)
+        law_overlap = min(overlap, 200)
+        if len(article_starts) < 2:
+            return _split_by_size(text, law_maximum, law_overlap)
+        boundaries = [0, *article_starts[1:], len(text)]
+        chunks: list[str] = []
+        for start, end in zip(boundaries, boundaries[1:]):
+            section = text[start:end].strip()
+            if not section:
+                continue
+            if len(section) <= law_maximum:
+                chunks.append(section)
+            else:
+                chunks.extend(_split_by_size(section, law_maximum, law_overlap))
+        return chunks
 
-    boundaries = [0, *article_starts[1:], len(text)]
-    chunks: list[str] = []
-    for start, end in zip(boundaries, boundaries[1:]):
-        section = text[start:end].strip()
-        if not section:
-            continue
-        if len(section) <= chunk_size:
-            chunks.append(section)
-        else:
-            chunks.extend(_split_by_size(section, chunk_size, overlap))
-    return chunks
+    if document_type == "업무매뉴얼":
+        manual_maximum = min(chunk_size, 1500)
+        return _pack_manual_sections(_heading_sections(text), 800, manual_maximum, min(overlap, 250))
+    return _split_by_size(text, chunk_size, overlap)
 
 
 def make_chunks(documents: list[SourceDocument], chunk_size: int = 1200, overlap: int = 200) -> list[DocumentChunk]:
     chunks: list[DocumentChunk] = []
     for document in documents:
-        for index, text in enumerate(split_text(document.text, chunk_size, overlap)):
+        for index, text in enumerate(split_text(document.text, chunk_size, overlap, document.document_type)):
             page_part = f"-p{document.page:04d}" if document.page else ""
             chunks.append(DocumentChunk(f"{document.file_hash[:24]}{page_part}-{index:05d}", text, document.path.name, document.relative_path, document.file_hash, index, document.category, document.document_type, document.page))
     return chunks

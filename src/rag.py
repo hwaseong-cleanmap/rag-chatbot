@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import math
 import shutil
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import chromadb
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from src.config import Settings
 from src.documents import LoadOutcome, corpus_fingerprint, load_documents, make_chunks, source_manifest
@@ -52,6 +54,8 @@ class AnswerResult:
     answer: str
     sources: list[str]
     evidence: list[SearchResult]
+    mode: str = "Cloudflare"
+    fallback_reason: str = ""
 
 
 class IndexStatusError(RuntimeError):
@@ -61,6 +65,76 @@ class IndexStatusError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.detail = detail
+
+
+class LocalFallbackError(RuntimeError):
+    """Cloudflare failed and the prepared local backup cannot serve a reply."""
+
+
+class LocalKeywordBackup:
+    """Fast, dependency-free local backup search used when Cloudflare is down.
+
+    It deliberately avoids a second full embedding pass, which can take hours
+    on a CPU-only Windows PC.  Ollama still creates the final grounded answer.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.path = settings.for_ollama().db_dir / "keyword_backup.json"
+
+    @staticmethod
+    def _tokens(value: str) -> list[str]:
+        return [token for token in __import__("re").findall(r"[0-9A-Za-z가-힣]{2,}", value.lower())]
+
+    def build(self, progress_callback: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
+        outcome = load_documents(
+            self.settings.data_dir,
+            progress_callback=(lambda current, total, _path: progress_callback("로컬 백업 문서 읽는 중", current, total)) if progress_callback else None,
+        )
+        chunks = make_chunks(outcome.documents, self.settings.chunk_size, self.settings.chunk_overlap)
+        records = [{
+            "text": chunk.text, "source": chunk.source, "relative_path": chunk.relative_path,
+            "file_hash": chunk.file_hash, "chunk_index": chunk.chunk_index,
+            "category": chunk.category, "document_type": chunk.document_type, "page": chunk.page,
+        } for chunk in chunks]
+        payload = {"status": "ready", "sources": source_manifest(self.settings.data_dir), "records": records}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(self.path)
+        return {"documents": outcome.processed_files, "total_files": outcome.total_files, "chunks": len(chunks), "failures": len(outcome.failed_files), "failed_files": outcome.failed_files}
+
+    def is_ready(self) -> bool:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            return payload.get("status") == "ready" and bool(payload.get("records"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+
+    def search(self, question: str, limit: int) -> list[SearchResult]:
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        tokens = self._tokens(question)
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for record in payload["records"]:
+            text = record["text"].lower()
+            score = sum(text.count(token) for token in tokens)
+            if score:
+                ranked.append((float(score), record))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [SearchResult(
+            text=record["text"], source=record["source"], similarity=score,
+            chunk_index=int(record["chunk_index"]), category=record["category"],
+            document_type=record["document_type"], page=record.get("page"),
+            relative_path=record["relative_path"], file_hash=record["file_hash"],
+        ) for score, record in ranked[:limit]]
+
+
+def _is_failover_error(error: Exception) -> bool:
+    """Only availability failures trigger a provider switch, never bad answers."""
+    return (
+        isinstance(error, (APIConnectionError, APITimeoutError))
+        or (isinstance(error, APIStatusError) and error.status_code in {408, 429, 500, 502, 503, 504})
+    )
 
 
 def filter_relevant(
@@ -95,7 +169,8 @@ class RagService:
         self.settings = settings
         # Long retries make a first-run indexing failure look like the app is frozen.
         # Fail within a reasonable time and show the error to the administrator instead.
-        self.client = OpenAI(api_key=settings.api_token, base_url=settings.base_url, timeout=30.0, max_retries=1)
+        timeout = 300.0 if settings.provider == "ollama" else 30.0
+        self.client = OpenAI(api_key=settings.api_token, base_url=settings.base_url, timeout=timeout, max_retries=1)
         if not settings.db_dir.exists():
             if not allow_create:
                 raise IndexStatusError(
@@ -127,7 +202,7 @@ class RagService:
             ) from error
         if saved.get("status") != "ready":
             raise IndexStatusError("INDEX_NOT_READY", "검색 DB 색인이 아직 완료되지 않았습니다.")
-        if saved.get("index_version") != 1:
+        if saved.get("index_version") != 2:
             raise IndexStatusError("VERSION_MISMATCH", "검색 DB 형식이 현재 앱 버전과 호환되지 않습니다.")
         if saved.get("settings") != self._manifest_settings():
             raise IndexStatusError("EMBEDDING_MODEL_MISMATCH", "검색 DB의 임베딩 또는 검색 설정이 현재 설정과 다릅니다.")
@@ -218,6 +293,11 @@ class RagService:
         if not force and self._load_cached_index(current_manifest, progress_callback):
             return self._stats(self.collection.count())
 
+        if not force:
+            incremental_stats = self._try_incremental_index(current_manifest, progress_callback)
+            if incremental_stats is not None:
+                return incremental_stats
+
         def report_document_progress(current: int, total: int, relative_path: str) -> None:
             if progress_callback:
                 progress_callback("문서 내용을 읽는 중", current, max(total, 1))
@@ -306,7 +386,7 @@ class RagService:
         """Load an unchanged persistent index without reading document contents."""
         try:
             saved = json.loads(self._manifest_path.read_text(encoding="utf-8"))
-            if saved.get("index_version") != 1 or saved.get("settings") != self._manifest_settings():
+            if saved.get("index_version") != 2 or saved.get("settings") != self._manifest_settings():
                 return False
             if saved.get("sources") != current_manifest:
                 return False
@@ -325,6 +405,122 @@ class RagService:
             progress_callback("기존 검색 색인을 불러왔습니다.", 1, 1)
         return True
 
+    def _try_incremental_index(
+        self,
+        current_manifest: list[dict[str, int | str]],
+        progress_callback: Callable[[str, int, int], None] | None,
+    ) -> dict[str, Any] | None:
+        """Update only added, changed, or removed files in an existing index.
+
+        Reading and embedding complete before the live collection is changed.
+        Thus a parser or AI API failure keeps the last verified index usable.
+        Version-1 indexes intentionally return ``None`` and are rebuilt once
+        into this version-2 format.
+        """
+        try:
+            saved = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+            if saved.get("index_version") != 2 or saved.get("settings") != self._manifest_settings():
+                return None
+            collection = self.chroma.get_collection(self.settings.collection_name)
+            if collection.count() <= 0:
+                return None
+            old_manifest = saved["sources"]
+            if not isinstance(old_manifest, list):
+                return None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+        old_by_path = {str(item["path"]): item for item in old_manifest}
+        new_by_path = {str(item["path"]): item for item in current_manifest}
+        changed = sorted(path for path, item in new_by_path.items() if old_by_path.get(path) != item)
+        removed = sorted(path for path in old_by_path if path not in new_by_path)
+        if not changed and not removed:
+            return None
+
+        changed_paths = [self.settings.data_dir / relative_path for relative_path in changed]
+        if progress_callback:
+            progress_callback("변경된 문서만 읽는 중", 0, len(changed_paths) or 1)
+        outcome = load_documents(
+            self.settings.data_dir,
+            progress_callback=(lambda current, total, _path: progress_callback("변경된 문서 읽는 중", current, total)) if progress_callback else None,
+            paths=changed_paths,
+        )
+        self.load_outcome = outcome
+        update_paths = {document.relative_path for document in outcome.documents}
+        delete_paths = set(removed) | update_paths
+        chunks = make_chunks(outcome.documents, self.settings.chunk_size, self.settings.chunk_overlap)
+        embeddings: list[list[float]] = []
+        for start in range(0, len(chunks), 100):
+            batch = chunks[start : start + 100]
+            if progress_callback:
+                progress_callback("변경 문서 벡터 생성 중", start, len(chunks) or 1)
+            embeddings.extend(self._embed([chunk.text for chunk in batch]))
+
+        # Do not delete older chunks until the potentially failing embedding
+        # request has completed successfully.
+        self.collection = collection
+        new_ids = {chunk.chunk_id for chunk in chunks}
+        if chunks:
+            self.collection.upsert(
+                ids=[chunk.chunk_id for chunk in chunks], documents=[chunk.text for chunk in chunks],
+                embeddings=embeddings,
+                metadatas=[{
+                    "source": chunk.source, "relative_path": chunk.relative_path,
+                    "file_hash": chunk.file_hash, "chunk_index": chunk.chunk_index,
+                    "category": chunk.category, "document_type": chunk.document_type,
+                    "page": chunk.page or 0,
+                } for chunk in chunks],
+            )
+        obsolete_ids: list[str] = []
+        for relative_path in delete_paths:
+            previous = self.collection.get(where={"relative_path": relative_path}, include=[])
+            obsolete_ids.extend(item for item in previous.get("ids", []) if item not in new_ids)
+        if obsolete_ids:
+            self.collection.delete(ids=obsolete_ids)
+        self._save_fallback_from_collection()
+
+        failed_paths = set(changed) - update_paths
+        committed_sources = [item for item in current_manifest if str(item["path"]) not in failed_paths]
+        metadata_snapshot = self.collection.get(include=["metadatas"])
+        category_counts = Counter(
+            str(metadata.get("category", "기타"))
+            for metadata in metadata_snapshot.get("metadatas", [])
+            if metadata is not None
+        )
+        stats = {
+            "documents": len(committed_sources), "total_files": len(current_manifest),
+            "chunks": self.collection.count(), "duplicates": len(outcome.skipped_duplicates),
+            "failures": len(outcome.failed_files), "pii_counts": outcome.pii_counts,
+            "category_counts": dict(category_counts), "failed_files": outcome.failed_files,
+            "incremental": {
+                "added_or_changed": len(update_paths), "removed": len(removed),
+                "unchanged": len(current_manifest) - len(changed),
+            },
+        }
+        self.cached_stats = stats
+        self._save_index_manifest(committed_sources, stats)
+        if progress_callback:
+            progress_callback("증분 색인 완료", len(update_paths) + len(removed), len(changed_paths) + len(removed) or 1)
+        return stats
+
+    def _save_fallback_from_collection(self) -> None:
+        """Refresh JSON fallback vectors after an incremental Chroma update."""
+        if self.collection is None:
+            return
+        data = self.collection.get(include=["documents", "metadatas", "embeddings"])
+        records = [
+            {"text": text, "embedding": embedding, "metadata": metadata}
+            for text, embedding, metadata in zip(
+                data.get("documents", []), data.get("embeddings", []), data.get("metadatas", []), strict=True
+            )
+            if text is not None and embedding is not None and metadata is not None
+        ]
+        temporary_path = self._fallback_path.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps({"records": records}, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+        )
+        temporary_path.replace(self._fallback_path)
+
     def _save_index_manifest(
         self,
         sources: list[dict[str, int | str]],
@@ -332,7 +528,7 @@ class RagService:
     ) -> None:
         payload = {
             "status": "ready",
-            "index_version": 1,
+            "index_version": 2,
             "vector_db_type": "chromadb",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "settings": self._manifest_settings(),
@@ -492,6 +688,10 @@ class RagService:
         if not question:
             return AnswerResult(NO_ANSWER, [], [])
         evidence = self.search(question)
+        return self.answer_from_evidence(question, evidence)
+
+    def answer_from_evidence(self, question: str, evidence: list[SearchResult]) -> AnswerResult:
+        """Generate a grounded answer from either vector or keyword evidence."""
         if not evidence:
             return AnswerResult(NO_ANSWER, [], [])
         context = "\n\n".join(
@@ -517,12 +717,67 @@ class RagService:
         answer = answer or NO_ANSWER
         if answer == NO_ANSWER:
             return AnswerResult(NO_ANSWER, [], evidence)
-        return AnswerResult(answer, list(dict.fromkeys(item.source for item in evidence)), evidence)
+        return AnswerResult(
+            answer, list(dict.fromkeys(item.source for item in evidence)), evidence,
+            mode="Ollama 로컬" if self.settings.provider == "ollama" else "Cloudflare",
+        )
+
+    def answer_with_local_fallback(self, question: str) -> AnswerResult:
+        """Use Cloudflare normally, then switch all RAG work to Ollama on outage.
+
+        The local index uses different embeddings, so it is searched afresh
+        rather than mixing incompatible Cloudflare and Ollama vectors.
+        """
+        try:
+            return self.answer(question)
+        except Exception as error:
+            if self.settings.provider != "cloudflare" or not _is_failover_error(error):
+                raise
+            reason = "Cloudflare 사용량 제한 또는 연결 오류"
+            try:
+                backup = LocalKeywordBackup(self.settings)
+                if not backup.is_ready():
+                    raise LocalFallbackError("로컬 백업 검색 색인이 없습니다.")
+                local = RagService(self.settings.for_ollama(), allow_create=True)
+                evidence = backup.search(question, self.settings.top_k)
+                result = local.answer_from_evidence(question, evidence)
+                local.chroma.close()
+                return AnswerResult(result.answer, result.sources, result.evidence, "Ollama 로컬 백업", reason)
+            except Exception as local_error:
+                raise LocalFallbackError(
+                    "Cloudflare를 사용할 수 없고 Ollama 로컬 백업도 준비되지 않았습니다. "
+                    "Ollama 설치·모델 내려받기 후 `python -m scripts.build_index`를 실행하세요."
+                ) from local_error
+
+    def local_backup_status(self) -> tuple[bool, str]:
+        """Return a lightweight readiness message for the Streamlit sidebar."""
+        if self.settings.provider != "cloudflare":
+            return True, "Ollama 로컬 모드"
+        if LocalKeywordBackup(self.settings).is_ready():
+            return True, "Ollama 로컬 백업 준비됨"
+        return False, "Ollama 로컬 백업 색인 필요"
 
 
 def build_index_atomically(settings: Settings, report: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
-    """Build in a staging directory, preserving the working index on failure."""
-    staging_dir = settings.db_dir.with_name(f"{settings.db_dir.name}_building")
+    """Reindex safely; use the fast incremental path when the index supports it."""
+    manifest_path = settings.db_dir / "index_manifest.json"
+    try:
+        saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        saved = {}
+    if saved.get("index_version") == 2:
+        service = RagService(settings)
+        try:
+            return service.ensure_index(force=False, progress_callback=report)
+        finally:
+            service.chroma.close()
+
+    # The first build, or migration from an older index, remains atomic.  The
+    # working index is replaced only after the staging index is validated.
+    # A previous interrupted Windows/Chroma process can retain a file handle
+    # in its old staging folder. A unique staging name lets the next run start
+    # safely instead of failing while deleting that unrelated stale folder.
+    staging_dir = settings.db_dir.with_name(f"{settings.db_dir.name}_building_{uuid4().hex}")
     backup_dir = settings.db_dir.with_name(f"{settings.db_dir.name}_backup")
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
@@ -563,3 +818,21 @@ def build_index_atomically(settings: Settings, report: Callable[[str, int, int],
     if backup_dir.exists():
         shutil.rmtree(backup_dir)
     return stats
+
+
+def build_all_indexes(settings: Settings, report: Callable[[str, int, int], None] | None = None) -> dict[str, dict[str, Any] | str]:
+    """Build the local backup first, then refresh the normal Cloudflare index.
+
+    The local backup remains usable even if Cloudflare's daily allowance has
+    already been exhausted during the second step.
+    """
+    result: dict[str, dict[str, Any] | str] = {}
+    try:
+        result["ollama"] = LocalKeywordBackup(settings).build(progress_callback=report)
+    except Exception as error:
+        result["ollama_error"] = str(error)
+    try:
+        result["cloudflare"] = build_index_atomically(settings, report=report)
+    except Exception as error:
+        result["cloudflare_error"] = str(error)
+    return result

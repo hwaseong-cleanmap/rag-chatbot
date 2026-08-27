@@ -10,6 +10,10 @@ venv/
 
 # Local vector database
 vector_db/
+vector_db_ollama/
+!vector_db_ollama/
+!vector_db_ollama/keyword_backup.json
+vector_db_ollama_building*/
 
 # Streamlit
 .streamlit/secrets.toml

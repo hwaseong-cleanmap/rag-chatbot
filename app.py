@@ -8,7 +8,7 @@ import streamlit as st
 
 from src.config import Settings
 from src.privacy import detect_personal_information
-from src.rag import IndexStatusError, RagService, build_index_atomically
+from src.rag import IndexStatusError, LocalFallbackError, LocalKeywordBackup, RagService, build_all_indexes
 
 
 SUGGESTIONS = {
@@ -30,7 +30,9 @@ def streamlit_secrets() -> Mapping[str, object]:
 
 @st.cache_resource(show_spinner=False)
 def get_service(settings: Settings) -> RagService:
-    return RagService(settings)
+    # Cloud deployment can use the committed lightweight keyword backup even
+    # when the private local Chroma index is intentionally unavailable.
+    return RagService(settings, allow_create=True)
 
 
 def show_sources(evidence: list[object]) -> None:
@@ -60,14 +62,14 @@ def show_sidebar(service: RagService, settings: Settings) -> None:
         if st.button("문서 다시 색인", width="stretch", icon=":material/refresh:"):
             try:
                 with st.spinner("문서를 확인하고 검색 색인을 준비하고 있습니다..."):
-                    stats = build_index_atomically(settings)
+                    results = build_all_indexes(settings)
                 get_service.clear()
-                st.success(f"정상 처리 {stats['documents']}건 · 청크 {stats['chunks']:,}개")
-                st.caption(f"중복 제외 {stats['duplicates']}건 · 처리 실패 {stats['failures']}건")
-                if stats["pii_counts"]:
-                    st.caption("개인정보 마스킹: " + ", ".join(f"{name} {count}건" for name, count in stats["pii_counts"].items()))
-                if stats["failed_files"]:
-                    st.caption("실패 파일: " + ", ".join(stats["failed_files"]))
+                for provider, label in (("ollama", "Ollama 로컬 백업"), ("cloudflare", "Cloudflare")):
+                    provider_stats = results.get(provider)
+                    if isinstance(provider_stats, dict):
+                        st.success(f"{label}: 문서 {provider_stats['documents']}건 · 청크 {provider_stats['chunks']:,}개")
+                    else:
+                        st.warning(f"{label} 색인 실패: {results.get(f'{provider}_error', '알 수 없는 오류')}")
                 st.rerun()
             except Exception as error:
                 st.error(f"색인 실패: {error}")
@@ -82,6 +84,8 @@ def show_sidebar(service: RagService, settings: Settings) -> None:
             st.code(settings.chat_model, language=None)
             st.caption("Vector DB")
             st.success("정상", icon=":material/check_circle:")
+            backup_ready, backup_message = service.local_backup_status()
+            (st.success if backup_ready else st.warning)(backup_message, icon=":material/check_circle:" if backup_ready else ":material/warning:")
 
 
 def main() -> None:
@@ -101,16 +105,21 @@ def main() -> None:
         st.code("Copy-Item .env.example .env", language="powershell")
         st.stop()
 
+    primary_index_ready = False
     try:
         service = get_service(settings)
         service.load_ready_index()
+        primary_index_ready = True
     except IndexStatusError as error:
-        st.error(
-            "검색 색인이 준비되지 않았습니다. 관리자가 VS Code 터미널에서 "
-            "`python -m scripts.build_index`를 한 번 실행해야 합니다."
-        )
-        st.caption(f"상태: {error.code}")
-        st.stop()
+        keyword_backup = LocalKeywordBackup(settings)
+        if not keyword_backup.is_ready():
+            st.error(
+                "검색 색인이 준비되지 않았습니다. 관리자가 VS Code 터미널에서 "
+                "`python -m scripts.build_index`를 한 번 실행해야 합니다."
+            )
+            st.caption(f"상태: {error.code}")
+            st.stop()
+        st.info("온라인 경량 검색 모드로 실행 중입니다. 근거 문서의 키워드를 우선 검색합니다.")
     except Exception as error:
         st.error(f"검색 DB를 여는 중 오류가 발생했습니다: {error}")
         st.stop()
@@ -144,7 +153,17 @@ def main() -> None:
     with st.chat_message("assistant", avatar=":material/smart_toy:"):
         try:
             with st.spinner("관련 업무자료를 검색하고 있습니다..."):
-                result = service.answer(question)
+                if primary_index_ready:
+                    result = service.answer_with_local_fallback(question)
+                else:
+                    evidence = LocalKeywordBackup(settings).search(question, settings.top_k)
+                    result = service.answer_from_evidence(question, evidence)
+            if result.mode == "Ollama 로컬 백업":
+                st.warning("Cloudflare를 사용할 수 없어 Ollama 로컬 백업 모드로 답변했습니다.")
+            elif primary_index_ready:
+                st.caption("현재 AI: Cloudflare")
+            else:
+                st.caption("현재 AI: Cloudflare · 온라인 경량 검색")
             st.markdown(result.answer)
             show_sources(result.evidence)
             if result.evidence:
@@ -153,6 +172,8 @@ def main() -> None:
                         st.caption(f"{item.source} · {item.category}" + (f" · {item.page}페이지" if item.page else ""))
                         st.write(item.text)
             st.session_state.messages.append({"role": "assistant", "content": result.answer, "evidence": result.evidence})
+        except LocalFallbackError as error:
+            st.error(str(error))
         except Exception as error:
             st.error(f"답변 생성 중 오류가 발생했습니다: {error}")
 
