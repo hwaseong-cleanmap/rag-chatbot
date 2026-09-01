@@ -761,15 +761,16 @@ class RagService:
                 backup = LocalKeywordBackup(self.settings)
                 if not backup.is_ready():
                     raise LocalFallbackError("로컬 백업 검색 색인이 없습니다.")
-                local = RagService(self.settings.for_ollama(), allow_create=True)
-                evidence = backup.search(question, self.settings.top_k)
+                local_settings = self.settings.for_ollama()
+                local = RagService(local_settings, allow_create=True)
+                evidence = backup.search(question, local_settings.top_k)
                 result = local.answer_from_evidence(question, evidence)
                 local.chroma.close()
                 return AnswerResult(result.answer, result.sources, result.evidence, "Ollama 로컬 백업", reason)
             except Exception as local_error:
                 raise LocalFallbackError(
                     "Cloudflare를 사용할 수 없고 Ollama 로컬 백업도 준비되지 않았습니다. "
-                    "Ollama 설치·모델 내려받기 후 `python -m scripts.build_index`를 실행하세요."
+                    "Ollama 설치·모델 내려받기 후 `python -m scripts.build_ollama_index`를 실행하세요."
                 ) from local_error
 
     def local_backup_status(self) -> tuple[bool, str]:

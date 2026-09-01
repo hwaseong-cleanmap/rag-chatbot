@@ -17,7 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CHAT_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
 DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-m3"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
-DEFAULT_OLLAMA_CHAT_MODEL = "qwen3:4b"
+# Pin the non-thinking variant.  The moving ``qwen3:4b`` tag currently points
+# at a thinking-only model, which can consume the full response budget before
+# producing an answer on a CPU-only Windows PC.
+DEFAULT_OLLAMA_CHAT_MODEL = "qwen3:4b-instruct"
 DEFAULT_OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 
 
@@ -93,6 +96,10 @@ class Settings:
             # A CPU-only local model can take longer than a remote API for a
             # large batch. Smaller batches avoid read timeouts on Windows PCs.
             embedding_batch_size=4,
+            # Keep the keyword evidence and answer within Ollama's default
+            # 4,096-token context on ordinary CPU-only office PCs.
+            top_k=min(self.top_k, 3),
+            max_answer_tokens=min(self.max_answer_tokens, 800),
             db_dir=PROJECT_ROOT / "vector_db_ollama",
             collection_name="hwaseong_collection_manuals_ollama",
         )
